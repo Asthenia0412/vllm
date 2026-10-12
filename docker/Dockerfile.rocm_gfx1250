@@ -587,9 +587,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Pre-install shared ROCm runtime dependencies.
-COPY requirements/common.txt requirements/rocm.txt /tmp/ci-base-requirements/
+COPY requirements/common.txt requirements/rocm.txt requirements/kv_connectors_rocm.txt /tmp/ci-base-requirements/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system -r /tmp/ci-base-requirements/rocm.txt \
+        -r /tmp/ci-base-requirements/kv_connectors_rocm.txt \
     && rm -rf /tmp/ci-base-requirements
 
 # Enable fast and less brittle model downloads in tests.
@@ -688,6 +689,7 @@ RUN --mount=type=bind,from=export_vllm,src=/,target=/install \
     --mount=type=cache,target=/root/.cache/uv \
     cd /install \
     && uv pip install --system -r requirements/rocm.txt \
+        -r requirements/kv_connectors_rocm.txt \
     && pip uninstall -y vllm \
     && uv pip install --system *.whl
 
