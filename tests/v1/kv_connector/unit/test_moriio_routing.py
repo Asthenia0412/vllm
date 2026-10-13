@@ -96,3 +96,52 @@ def test_request_finished_no_kv_params_is_noop():
 
     assert delay_free is False
     assert params is None
+
+
+def test_request_finished_accepts_finished_stopped_as_success():
+    """P-side remote decode with FINISHED_STOPPED must still export block IDs.
+
+    Mirror the NIXL scheduler: both FINISHED_LENGTH_CAPPED and FINISHED_STOPPED
+    are valid terminal completion states for a prefill leg that ran with
+    ``do_remote_decode=True``. A request whose first generated token is EOS
+    reaches FINISHED_STOPPED (check_stop fires before the max-token cap), and
+    those prefill blocks still need to be returned to the decode side.
+
+    Regression test for issue where MoRIIO only accepted FINISHED_LENGTH_CAPPED
+    and silently returned ``(False, None)`` for FINISHED_STOPPED requests.
+    """
+    s = _producer(global_dp_rank=4, dp_size=8, dp_size_local=8)
+    req = _req(
+        "r4",
+        {"do_remote_decode": True, "transfer_id": "t4"},
+        status=RequestStatus.FINISHED_STOPPED,
+    )
+
+    delay_free, params = _request_finished(s, req, block_ids=[1, 2, 3])
+
+    # Non-empty block_ids => delay-free send with params exported.
+    assert params is not None, (
+        "FINISHED_STOPPED producer-side request must export KV transfer params"
+    )
+    assert params["do_remote_prefill"] is True
+    assert params["do_remote_decode"] is False
+    assert params["remote_block_ids"] == [[1, 2, 3]]
+    assert params["transfer_id"] == "t4"
+    assert params["remote_dp_rank"] == 4
+
+
+def test_request_finished_still_rejects_aborted_status():
+    """Non-terminal statuses (e.g. ABORTED) must NOT export block IDs."""
+    from vllm.v1.request import RequestStatus
+
+    s = _producer(global_dp_rank=0, dp_size=4, dp_size_local=4)
+    req = _req(
+        "r5",
+        {"do_remote_decode": True, "transfer_id": "t5"},
+        status=RequestStatus.ABORTED,
+    )
+
+    delay_free, params = _request_finished(s, req, block_ids=[1, 2, 3])
+
+    assert delay_free is False
+    assert params is None
