@@ -53,6 +53,21 @@ pynvml = import_pynvml()
 torch.backends.cuda.enable_cudnn_sdp(False)
 
 
+# Disable cuBLAS split-K GEMM to ensure deterministic floating-point reductions
+# across repeated generate() calls on the same engine instance. Without this,
+# cuBLAS may use split-K algorithms with atomicAdd reduction whose order
+# depends on GPU thread scheduling, causing tiny logit differences that can
+# flip greedy argmax boundaries (see vllm-project/vllm#61319).
+# Setting a small workspace size forces cuBLAS to use non-split-K kernels
+# and a fixed seed ensures deterministic algorithm selection.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":16:8")
+os.environ.setdefault("CUBLASLT_WORKSPACE_SIZE", "1")
+
+# Make cuDNN use deterministic algorithms instead of autotuning.
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
+
+
 @lru_cache(maxsize=8)
 def _cuda_device_count_stateless(cuda_visible_devices: str | None = None) -> int:
     """Get number of CUDA devices, caching based on the value of CUDA_VISIBLE_DEVICES
