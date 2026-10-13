@@ -290,6 +290,61 @@ def test_mamba_cache_mode_all_is_rejected():
         CacheConfig(mamba_cache_mode="all")
 
 
+def test_post_init_rejects_mismatched_float_kv_cache():
+    """An explicit float KV dtype must match the model dtype.
+
+    Covers both the plain-dtype path (#60859) and the online fp8
+    quantization path (#61314) — quantized linear layers do not change
+    the attention query dtype, so a mismatched float KV still crashes
+    FlashAttention at CUDA-graph capture time.
+    """
+
+    def model(dtype):
+        return SimpleNamespace(
+            dtype=dtype,
+            is_submodel_config=False,
+            is_hybrid=False,
+            architecture=None,
+            multimodal_config=None,
+        )
+
+    def assert_rejected(cache_dtype, model_dtype, message):
+        config = VllmConfig(cache_config=CacheConfig(cache_dtype=cache_dtype))
+        config.model_config = model(model_dtype)
+        with pytest.raises(ValueError, match=message):
+            config._reject_mismatched_float_kv_cache()
+
+    def assert_accepted(cache_dtype, model_dtype):
+        config = VllmConfig(cache_config=CacheConfig(cache_dtype=cache_dtype))
+        config.model_config = model(model_dtype)
+        config._reject_mismatched_float_kv_cache()  # should not raise
+
+    assert_rejected(
+        "float16",
+        torch.bfloat16,
+        r'kv_cache_dtype="float16" is incompatible with dtype="bfloat16"\. '
+        r"Please set `--kv-cache-dtype` to `auto` or `bfloat16`\.",
+    )
+    assert_rejected(
+        "bfloat16",
+        torch.float16,
+        r'kv_cache_dtype="bfloat16" is incompatible with dtype="float16"\. '
+        r"Please set `--kv-cache-dtype` to `auto` or `float16`\.",
+    )
+    assert_rejected(
+        "float16",
+        torch.float32,
+        r'kv_cache_dtype="float16" is incompatible with dtype="float32"\. '
+        r"Please set `--kv-cache-dtype` to `auto`\.",
+    )
+    # Matching dtypes pass, auto passes, quantized KV dtypes are untouched.
+    assert_accepted("float16", torch.float16)
+    assert_accepted("bfloat16", torch.bfloat16)
+    assert_accepted("auto", torch.bfloat16)
+    assert_accepted("fp8", torch.bfloat16)
+    assert_accepted("float16", torch.float16)
+
+
 def test_per_request_spec_decode_metrics_requires_spec_decode():
     # The flag only makes sense with speculative decoding configured; enabling
     # it without --speculative-config should fail fast rather than silently

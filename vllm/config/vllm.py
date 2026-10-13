@@ -1411,6 +1411,43 @@ class VllmConfig:
         self.engram_config.verify_parallel_config(self.parallel_config)
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
+    def _reject_mismatched_float_kv_cache(self) -> None:
+        """Reject an explicit float16/bfloat16 KV dtype that differs from the model.
+
+        FlashAttention and FlashInfer require query and key to share a dtype.
+        An explicit unquantized float16/bfloat16 kv_cache_dtype that differs
+        from the model checkpoint dtype crashes kernel init — both on plain
+        checkpoints (#60859) and with online fp8 quantization (#61314),
+        because quantized linear layers do not affect the attention query
+        tensor dtype.
+
+        Quantized kv_cache_dtype values (fp8, nvfp4, per-token-head, …) are
+        intentionally left alone: they have their own per-backend support
+        checks and a different failure mode.
+        """
+        if self.model_config is None:
+            return
+        cache_dtype = self.cache_config.cache_dtype
+        # Only unquantized float KV dtypes need this check.
+        if cache_dtype not in ("float16", "bfloat16"):
+            return
+        expected_dtype = torch.float16 if cache_dtype == "float16" else torch.bfloat16
+        if self.model_config.dtype == expected_dtype:
+            return
+        model_dtype_str = {
+            torch.float16: "float16",
+            torch.bfloat16: "bfloat16",
+            torch.float32: "float32",
+        }.get(self.model_config.dtype, str(self.model_config.dtype))
+        if model_dtype_str in ("float16", "bfloat16"):
+            hint = f"Please set `--kv-cache-dtype` to `auto` or `{model_dtype_str}`."
+        else:
+            hint = "Please set `--kv-cache-dtype` to `auto`."
+        raise ValueError(
+            f'kv_cache_dtype="{cache_dtype}" is incompatible with '
+            f'dtype="{model_dtype_str}". {hint}'
+        )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
         # To give each torch profile run a unique instance name.
@@ -1441,6 +1478,7 @@ class VllmConfig:
             logger.info_once("Performance mode set to '%s'.", self.performance_mode)
 
         self.try_verify_and_update_config()
+        self._reject_mismatched_float_kv_cache()
         self._resolve_and_verify_engram_config()
 
         self._check_supports_watermarking()
