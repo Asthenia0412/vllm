@@ -404,26 +404,33 @@ def split_audio(
     overlap_duration_s: float,
     min_energy_window_size: int,
 ) -> list[np.ndarray]:
-    """Split audio into chunks with intelligent split points.
+    """Split audio into non-overlapping chunks with intelligent split points.
 
     Splits long audio into smaller chunks at low-energy regions to minimize
-    cutting through speech. Uses overlapping windows to find quiet moments
-    for splitting.
+    cutting through speech. No overlap is introduced between consecutive
+    chunks; ``overlap_duration_s`` controls the size of the backward search
+    window used to find the best split point near the nominal chunk boundary.
 
     Args:
         audio_data: 1D mono audio array to split. ASR models consume mono, so
                    callers must downmix before chunking.
         sample_rate: Sample rate of the audio in Hz.
-        max_clip_duration_s: Maximum duration of each chunk in seconds.
-        overlap_duration_s: Overlap duration in seconds between consecutive chunks.
-                           Used to search for optimal split points.
-        min_energy_window_size: Window size in samples for finding low-energy regions.
+        max_clip_duration_s: Maximum (nominal) duration of each chunk in
+            seconds. The actual chunk may be shorter if a low-energy split
+            point is found earlier within the search window.
+        overlap_duration_s: Size of the backward search window (in seconds)
+            before the nominal chunk boundary. Within this window, the
+            function looks for the quietest moment to split; this is not
+            audio overlap between chunks.
+        min_energy_window_size: Window size in samples for finding low-energy
+            regions.
 
     Returns:
-        List of 1D audio chunks.
+        List of 1D audio chunks. Consecutive chunks are adjacent (no gap, no
+        overlap), so the sum of chunk lengths equals ``audio_data`` length.
 
     Raises:
-        AssertionError: If ``audio_data`` is not 1D.
+        ValueError: If ``audio_data`` is not 1D.
 
     Example:
         >>> audio = np.random.randn(1040000)  # 65 seconds at 16kHz
@@ -454,7 +461,9 @@ def split_audio(
             chunks.append(audio_data[..., i:])
             break
 
-        # Find the best split point in the overlap region
+        # Find the best split point within the backward search window.
+        # The search range is [nominal_boundary - overlap_size, nominal_boundary],
+        # i.e. we look backward from the nominal chunk end to find a quiet spot.
         search_start = i + chunk_size - overlap_size
         search_end = min(i + chunk_size, audio_data.shape[-1])
         split_point = find_split_point(
