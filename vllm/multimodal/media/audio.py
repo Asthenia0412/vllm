@@ -39,9 +39,9 @@ except ImportError:
     soundfile = PlaceholderModule("soundfile")  # type: ignore[assignment]
 
 
-def _load_torchcodec_audio_decoder() -> tuple[
-    Callable[..., Any] | None, BaseException | None
-]:
+def _load_torchcodec_audio_decoder() -> (
+    tuple[Callable[..., Any] | None, BaseException | None]
+):
     try:
         from torchcodec.decoders import AudioDecoder
     except (ImportError, OSError, RuntimeError) as exc:
