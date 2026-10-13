@@ -23,7 +23,38 @@ if TYPE_CHECKING:
 
 @dataclass
 class NixlKVConnectorStats(KVConnectorStats):
-    """Container for transfer performance metrics."""
+    """Per-rank transfer telemetry container for the NIXL KV connector.
+
+    Each tensor-parallel (TP) rank records its own per-transfer observations
+    into the ``data`` dict via :meth:`record_transfer`.  Before logging,
+    observations from **all TP ranks are pooled** by the
+    :class:`KVConnectorLogging` pipeline (see
+    :meth:`KVConnectorLogging.observe` → :meth:`aggregate` →
+    :meth:`reduce` → :meth:`KVConnectorLogging.log`).
+
+    The resulting summary stats therefore describe the combined observation
+    pool across every rank in the TP group:
+
+    - ``Num successful transfers`` — total count across **all** ranks, not
+      per-rank.
+    - ``Avg MB per transfer`` — average over the pooled list of
+      per-transfer byte counts (i.e. each rank-level transfer is one
+      sample), **not** the total bytes moved for a single logical KV
+      transfer that spans multiple ranks.
+    - ``Throughput (MB/s)`` — ``total_MB_all_ranks / total_transfer_time_all_ranks``,
+      effectively the **per-rank average throughput**; it is **not** the
+      aggregate system throughput.
+    - ``P90 xfer time`` / ``P90 post time`` — percentiles over the combined
+      distribution of transfer/post times from every rank.
+
+    Failure counters (``num_failed_transfers``, ``num_failed_handshakes``,
+    ``num_failed_notifications``, ``num_kv_expired_reqs``,
+    ``num_notifications_after_expiry``) are also pooled across ranks and
+    reported as totals.
+
+    This class must remain JSON-serializable because the logger process
+    receives a serialized copy of the stats payload from the workers.
+    """
 
     def __post_init__(self):
         if not self.data:
@@ -33,10 +64,15 @@ class NixlKVConnectorStats(KVConnectorStats):
     def reset(self):
         # Must be serializable
         self.data: dict[str, list[float | int]] = {
-            "transfer_duration": [],
-            "post_duration": [],
-            "bytes_transferred": [],
-            "num_descriptors": [],
+            # Per-rank telemetry recorded by record_transfer():
+            "transfer_duration": [],       # Time for RDMA data movement (seconds)
+            "post_duration": [],           # Time to submit the RDMA WR to the
+                                            # backend before the async transfer
+                                            # begins (seconds). *Not* a
+                                            # post-transfer notification.
+            "bytes_transferred": [],       # Per-transfer payload size (bytes)
+            "num_descriptors": [],        # Per-transfer descriptor count
+            # Failure counters — each append == one failure event:
             "num_failed_transfers": [],
             "num_failed_notifications": [],
             "num_failed_handshakes": [],
@@ -90,6 +126,15 @@ class NixlKVConnectorStats(KVConnectorStats):
         )
 
     def aggregate(self, other: KVConnectorStats) -> KVConnectorStats:
+        """Pool observations from ``other`` into ``self`` by list-extending.
+
+        This is called by :meth:`KVConnectorLogging.observe` to merge stats
+        arriving from different TP ranks (or from multiple periodic syncs
+        within the same logging interval).  The operation is **not** a
+        numerical reduction — it is a simple concatenation so that
+        :meth:`reduce` can later compute a mean/percentile over the full
+        combined observation pool.
+        """
         if not other.is_empty():
             for k, v in other.data.items():
                 accumulator = self.data[k]
@@ -98,7 +143,27 @@ class NixlKVConnectorStats(KVConnectorStats):
         return self
 
     def reduce(self) -> dict[str, int | float]:
-        # Compute compact representative stats suitable for CLI logging.
+        """Summarize the pooled observation pool into CLI-logged metrics.
+
+        All timing, size, and descriptor counts in ``self.data`` are already
+        the **concatenation of every TP rank's observations** for this
+        logging interval (see :meth:`aggregate`).  The computations below
+        operate on that combined pool:
+
+        - ``Avg xfer time`` / ``P90 xfer time`` — mean / 90th percentile of
+          the **per-rank transfer-duration samples** (one sample per
+          rank-level transfer), in ms.
+        - ``Throughput (MB/s)`` — ``total_MB_all_ranks / Σ transfer_duration_all_ranks``.
+          Because each rank reports independently, this is the **per-rank
+          average throughput**, not the aggregate system throughput
+          (which would require dividing by the wall-clock interval).
+        - ``Avg MB per transfer`` — mean of the per-rank bytes-transferred
+          samples.  A single logical KV transfer that spans N TP ranks
+          contributes **N samples**, so this is *not* the total bytes moved
+          per logical transfer.
+        - Failure counts are simple lengths of the corresponding pooled
+          lists and represent total events across all ranks.
+        """
         # Failure counts are reported on every interval: transfer, handshake
         # and notification failures are grouped as sporadic
         # lower-transport-layer events, while KV expiry is reported separately
@@ -130,15 +195,23 @@ class NixlKVConnectorStats(KVConnectorStats):
 
         xfer_time = np.asarray(self.data["transfer_duration"])
         post_time = np.asarray(self.data["post_duration"])
-        # Convert to MB for CLI logging.
+        # Convert to MB for CLI logging.  Note: each entry in ``mb`` is
+        # the bytes transferred by one TP rank for one transfer — a
+        # single logical KV transfer spanning N ranks therefore produces
+        # N entries in this list.
         mb = np.asarray(self.data["bytes_transferred"]) / 2**20
         descs = np.asarray(self.data["num_descriptors"], dtype=np.uint32)
         n = len(descs)
         assert n == self.num_successful_transfers
 
         total_mb = mb.sum()
+        # Per-rank sample mean — *not* total MB per logical KV transfer.
         avg_mb = total_mb / n
 
+        # Sum of per-rank transfer durations across the pooled pool.  This
+        # is NOT wall-clock time (each rank ran in parallel), so dividing
+        # total_mb by it yields an average per-rank throughput figure,
+        # not the aggregate system throughput.
         total_time_seconds = xfer_time.sum()
         throughput_mb_s = total_mb / total_time_seconds
 

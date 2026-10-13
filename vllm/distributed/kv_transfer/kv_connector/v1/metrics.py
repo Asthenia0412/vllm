@@ -17,10 +17,29 @@ logger = init_logger(__name__)
 
 @dataclass
 class KVConnectorStats:
-    """Base class for KV Connector Stats, a container for transfer performance
-    metrics or otherwise important telemetry from the connector.
-    All sub-classes need to be serializable as stats are sent from worker to
-    logger process.
+    """Base class for per-connector transfer telemetry containers.
+
+    Subclasses (e.g. :class:`NixlKVConnectorStats`) hold raw observations
+    recorded on each worker rank and must remain JSON-serializable because
+    they are shipped from worker processes to the logger process.
+
+    The stats flow through four stages before being printed to the log:
+
+    1. **Record** — workers call connector-specific ``record_*`` helpers
+       to append per-transfer samples into ``self.data``.
+    2. **Observe / Aggregate** (:class:`KVConnectorLogging.observe` →
+       :meth:`aggregate`) — the logger receives one ``KVConnectorStats``
+       payload per worker (already pooled across TP ranks on that worker)
+       and merges each incoming payload into an accumulator via
+       ``list.extend()``.  Aggregation does **not** compute means — it
+       merely concatenates observations.
+    3. **Reduce** (:meth:`reduce`) — converts the pooled observation
+       pool into a small dict of CLI-friendly summary numbers (avg, p90,
+       throughput, failure counts, …).  See the subclass docstring for
+       the exact semantics — numbers like "throughput" and "avg MB per
+       transfer" are often per-rank averages, not per-engine totals.
+    4. **Log** (:class:`KVConnectorLogging.log`) — formats and prints the
+       reduced dict, then resets the accumulator for the next interval.
     """
 
     data: dict[str, Any] = field(default_factory=dict)
@@ -51,6 +70,18 @@ class KVConnectorStats:
 
 
 class KVConnectorLogging:
+    """Observer that collects per-worker KV connector stats and logs them.
+
+    This class lives on the logger process and drives the
+    ``observe() → aggregate() → reduce() → log()`` pipeline documented on
+    :class:`KVConnectorStats`.  Callers feed it worker payloads via
+    :meth:`observe`; every call merges the worker's pre-aggregated stats
+    (already pooled across all TP ranks on that worker) into an internal
+    accumulator.  When the logging timer fires, :meth:`log` is called — it
+    invokes :meth:`~KVConnectorStats.reduce` on the accumulator, prints the
+    resulting summary dict, and resets for the next interval.
+    """
+
     def __init__(self, kv_transfer_config: KVTransferConfig | None):
         # Instantiate the connector's stats class.
         if kv_transfer_config and kv_transfer_config.kv_connector:
@@ -63,12 +94,16 @@ class KVConnectorLogging:
         self.transfer_stats_accumulator: KVConnectorStats | None = None
 
     def observe(self, transfer_stats_data: dict[str, Any]):
+        """Ingest one worker's serialized stats payload.
+
+        The payload is *already pooled across all TP ranks on that worker*
+        (workers aggregate their own ranks before serialising).  This
+        method wraps it in the connector-specific ``KVConnectorStats``
+        subclass and merges it into the interval accumulator via
+        :meth:`KVConnectorStats.aggregate`.
+        """
         # Should not be called when a KVConnector is not configured.
         assert self.connector_cls is not None
-        # Called periodically when connector syncs with the scheduler.
-        # Note that this is not the same as the logging interval.
-        # We expect transfer_stats_data to be aggregated across all workers and
-        # consist of observations from a single connector or a MultiConnector.
         transfer_stats = self.connector_cls.build_kv_connector_stats(
             transfer_stats_data
         )
