@@ -280,3 +280,56 @@ def test_extra_args_preserves_custom_objects_and_shared_containers():
     params = SamplingParams(extra_args=extra_args)
     assert params.extra_args["first"][0] is custom
     assert params.extra_args["first"] is params.extra_args["second"]
+
+
+def _validate_sampling_mask_params(params: SamplingParams) -> None:
+    """Run admission validation for return_sampling_mask with verify stubbed."""
+    from unittest.mock import patch
+
+    processor = SimpleNamespace(
+        model_config=MockModelConfig(return_sampling_mask=True),
+        vllm_config=SimpleNamespace(
+            reasoning_config=None,
+            _check_supports_watermarking=lambda params: False,
+        ),
+        resolve_watermarking=lambda params: False,
+        speculative_config=None,
+        structured_outputs_config=None,
+        diffusion_config=None,
+        tokenizer=None,
+        validate_logits_processors_params=lambda params: None,
+    )
+    with patch.object(SamplingParams, "verify"):
+        InputProcessor._validate_params(processor, params, ("generate",))
+
+
+@pytest.mark.cpu_test
+def test_return_sampling_mask_reports_all_unmet_preconditions():
+    """Both temperature and top_k failures surface in one VLLMValidationError."""
+    with pytest.raises(VLLMValidationError) as exc_info:
+        _validate_sampling_mask_params(
+            SamplingParams(temperature=0.0, max_tokens=16)
+        )
+    err = str(exc_info.value)
+    assert "temperature > 0" in err
+    assert "top_k > 0" in err
+
+
+@pytest.mark.cpu_test
+def test_return_sampling_mask_reports_top_k_alone():
+    """When only top_k fails, temperature must not appear in the message."""
+    with pytest.raises(VLLMValidationError) as exc_info:
+        _validate_sampling_mask_params(
+            SamplingParams(temperature=0.7, max_tokens=16)
+        )
+    err = str(exc_info.value)
+    assert "top_k > 0" in err
+    assert "temperature > 0" not in err
+
+
+@pytest.mark.cpu_test
+def test_return_sampling_mask_accepts_valid_params():
+    """Valid params (temperature > 0, top_k > 0) must pass admission."""
+    _validate_sampling_mask_params(
+        SamplingParams(temperature=0.7, top_k=50, max_tokens=16)
+    )
