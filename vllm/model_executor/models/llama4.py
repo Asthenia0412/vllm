@@ -433,13 +433,19 @@ class Llama4Model(LlamaModel):
         # [num_experts, hidden_in, hidden_out], so we must transpose the last
         # two dimensions to match the expected layout of the parameters.
         if fused and loaded_weight.ndim == 3:
-            loaded_weight = loaded_weight.transpose(-1, -2)
+            # .contiguous() is critical here: transpose returns a non-
+            # contiguous view, and copying a non-contiguous CPU tensor to GPU
+            # is orders of magnitude slower (3-4s per expert block, see
+            # https://github.com/vllm-project/vllm/issues/31624).
+            loaded_weight = loaded_weight.transpose(-1, -2).contiguous()
 
             # If the gate_proj and up_proj weights are fused into a single
             # weight tensor, we need to split the weight tensor into a tuple
             # of two weight tensors along the hidden_out dimension.
             if "experts.gate_up_proj" in name:
-                loaded_weight = loaded_weight.chunk(2, dim=-2)
+                loaded_weight = tuple(
+                    chunk.contiguous() for chunk in loaded_weight.chunk(2, dim=-2)
+                )
 
         # Iterate over all the expert parameters and load the weights if we find
         # a match in weight name.
@@ -524,6 +530,11 @@ class Llama4Model(LlamaModel):
 
             # Load the weight into the module parameter with corresponding
             # shard id and expert id.
+            # Ensure the source tensor is contiguous before the CPU->GPU copy.
+            # Non-contiguous CPU tensors make the copy extremely slow
+            # (3-4s per expert block, see issue #31624).
+            if not new_loaded_weight.is_contiguous():
+                new_loaded_weight = new_loaded_weight.contiguous()
             weight_loader(
                 param,
                 new_loaded_weight,
@@ -679,7 +690,9 @@ class Llama4Model(LlamaModel):
                             and loaded_weight.dtype == torch.float8_e4m3fn
                             and loaded_weight.ndim == 3
                         ):
-                            loaded_weight = loaded_weight.transpose(-1, -2)
+                            loaded_weight = loaded_weight.transpose(
+                                -1, -2
+                            ).contiguous()
 
                         # Load the weight into the module parameter with
                         # corresponding shard id and expert id.
