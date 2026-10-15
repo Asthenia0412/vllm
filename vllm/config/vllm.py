@@ -73,6 +73,7 @@ logger = init_logger(__name__)
 
 DEFAULT_BREAKABLE_CUDAGRAPH_ARCHITECTURES = frozenset(
     {
+        "AliceAIForCausalLM",
         "DeepseekV32MTPModel",
         "DeepseekV32ForCausalLM",
         "DeepseekV4ForCausalLM",
@@ -1199,6 +1200,21 @@ class VllmConfig:
         ):
             return
 
+        if self.model_config is not None and self.model_config.enable_sleep_mode:
+            # Lazy import to avoid circular dependencies
+            from vllm.distributed.kv_transfer.kv_connector.factory import (
+                KVConnectorFactory,
+            )
+
+            connector_cls = KVConnectorFactory.get_connector_class(
+                self.kv_transfer_config
+            )
+            if not connector_cls.supports_sleep_mode(self.kv_transfer_config):
+                raise ValueError(
+                    f"{self.kv_transfer_config.kv_connector} does not support "
+                    "sleep mode."
+                )
+
         # PyTorch's expandable_segments allocator uses CUDA VMM, which can
         # remap a virtual address range to different physical pages over the
         # engine's lifetime. KV connectors that pin KV cache memory (e.g.
@@ -1412,40 +1428,21 @@ class VllmConfig:
         logger.info_once("Resolved Engram configuration: %s", str(self.engram_config))
 
     def _reject_mismatched_float_kv_cache(self) -> None:
-        """Reject an explicit float16/bfloat16 KV dtype that differs from the model.
-
-        FlashAttention and FlashInfer require query and key to share a dtype.
-        An explicit unquantized float16/bfloat16 kv_cache_dtype that differs
-        from the model checkpoint dtype crashes kernel init — both on plain
-        checkpoints (#60859) and with online fp8 quantization (#61314),
-        because quantized linear layers do not affect the attention query
-        tensor dtype.
-
-        Quantized kv_cache_dtype values (fp8, nvfp4, per-token-head, …) are
-        intentionally left alone: they have their own per-backend support
-        checks and a different failure mode.
-        """
-        if self.model_config is None:
-            return
+        """Reject an explicit float16/bfloat16 KV dtype that differs from the model."""
         cache_dtype = self.cache_config.cache_dtype
-        # Only unquantized float KV dtypes need this check.
-        if cache_dtype not in ("float16", "bfloat16"):
+        if self.model_config is None or cache_dtype not in ("float16", "bfloat16"):
             return
-        expected_dtype = torch.float16 if cache_dtype == "float16" else torch.bfloat16
-        if self.model_config.dtype == expected_dtype:
+        model_dtype = str(self.model_config.dtype).removeprefix("torch.")
+        if model_dtype == cache_dtype:
             return
-        model_dtype_str = {
-            torch.float16: "float16",
-            torch.bfloat16: "bfloat16",
-            torch.float32: "float32",
-        }.get(self.model_config.dtype, str(self.model_config.dtype))
-        if model_dtype_str in ("float16", "bfloat16"):
-            hint = f"Please set `--kv-cache-dtype` to `auto` or `{model_dtype_str}`."
-        else:
-            hint = "Please set `--kv-cache-dtype` to `auto`."
+        allowed = (
+            f"`auto` or `{model_dtype}`"
+            if model_dtype in ("float16", "bfloat16")
+            else "`auto`"
+        )
         raise ValueError(
             f'kv_cache_dtype="{cache_dtype}" is incompatible with '
-            f'dtype="{model_dtype_str}". {hint}'
+            f'dtype="{model_dtype}". Please set `--kv-cache-dtype` to {allowed}.'
         )
 
     def __post_init__(self):
@@ -1570,8 +1567,6 @@ class VllmConfig:
                 self.quant_config.use_deep_gemm = False
                 logger.warning_once(
                     "Auto-disabled DeepGemm for model_type=%s on Blackwell. "
-                    "DeepGemm E8M0 scale format causes accuracy degradation "
-                    "for this architecture. Falling back to CUTLASS. "
                     "To disable DeepGemm globally, set VLLM_USE_DEEP_GEMM=0.",
                     model_type,
                 )
@@ -2141,17 +2136,28 @@ class VllmConfig:
 
         if self.parallel_config.use_ubatching:
             a2a_backend = self.parallel_config.all2all_backend
-            assert a2a_backend in [
-                "deepep_low_latency",
-                "deepep_high_throughput",
-                "nixl_ep",
-            ], (
-                "Microbatching currently only supports the deepep_low_latency, "
-                "deepep_high_throughput, and nixl_ep all2all backends. "
-                f"{a2a_backend} is not supported. To fix use "
-                "--all2all-backend=deepep_low_latency, "
-                "--all2all-backend=deepep_high_throughput, or "
-                "--all2all-backend=nixl_ep and install the matching kernels."
+            if current_platform.is_rocm():
+                supported_backends = [
+                    "deepep_low_latency",
+                    "deepep_high_throughput",
+                    "nixl_ep",
+                    # The naive DP/EP prepare/finalize runs its all-gather /
+                    # reduce-scatter on the comm stream under DBO.
+                    "allgather_reducescatter",
+                ]
+            else:
+                # CUDA and other platforms.
+                supported_backends = [
+                    "deepep_low_latency",
+                    "deepep_high_throughput",
+                    "nixl_ep",
+                ]
+            assert a2a_backend in supported_backends, (
+                "Microbatching currently only supports the "
+                f"{', '.join(supported_backends)} all2all backends on this "
+                f"platform. {a2a_backend} is not supported. To fix use one of "
+                f"{', '.join('--all2all-backend=' + b for b in supported_backends)}"
+                " and install the matching kernels."
             )
 
         if not self.instance_id:
@@ -2172,10 +2178,10 @@ class VllmConfig:
         self._verify_aux_output_compatibility()
 
         # Hybrid KV cache manager (HMA) runtime rules:
-        # - Explicit enable (--no-disable-kv-cache-manager): error if runtime
+        # - Explicit enable (--enable-hybrid-kv-cache-manager): error if runtime
         #   disables it
         # - No preference: auto-disable for unsupported features or connector configs
-        # - Explicit disable (--disable-kv-cache-manager): always respect it
+        # - Explicit disable (--disable-hybrid-kv-cache-manager): always respect it
         need_disable_hybrid_kv_cache_manager = False
         # logger should only print warning message for hybrid models. As we
         # can't know whether the model is hybrid or not now, so we don't log
@@ -2236,7 +2242,7 @@ class VllmConfig:
             raise ValueError(
                 "Hybrid KV cache manager was explicitly enabled but is not "
                 "supported in this configuration. Consider omitting the "
-                "--no-disable-hybrid-kv-cache-manager flag to let vLLM decide"
+                "--enable-hybrid-kv-cache-manager flag to let vLLM decide"
                 " automatically."
             )
 
@@ -2963,12 +2969,7 @@ class VllmConfig:
             unsupported.append("pipeline parallelism with external_launcher")
 
         if speculative_config is not None:
-            if speculative_config.method in (
-                "suffix",
-                "medusa",
-                "mlp_speculator",
-                "custom_class",
-            ):
+            if speculative_config.method in ("suffix", "custom_class"):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
@@ -3410,7 +3411,7 @@ class VllmConfig:
             if self.cache_config.mamba_cache_mode != "none":
                 raise ValueError(
                     "FlashInfer ReplaySSM speculative decoding does not support "
-                    "prefix caching; use --no-enable-prefix-caching"
+                    "prefix caching; use --disable-prefix-caching"
                 )
             query_len = 1 + self.num_speculative_tokens
             if self.cache_config.replayssm_buffer_len < query_len:
@@ -3429,7 +3430,7 @@ class VllmConfig:
             if self.cache_config.mamba_cache_mode == "align":
                 raise ValueError(
                     "FlashInfer ReplaySSM does not support prefix caching yet; "
-                    "use --no-enable-prefix-caching"
+                    "use --disable-prefix-caching"
                 )
         elif self.mamba_config.backend != MambaBackendEnum.TRITON:
             raise ValueError(
