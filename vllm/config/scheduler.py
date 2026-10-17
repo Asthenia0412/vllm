@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "srjf"]
 
 
 @config
@@ -216,6 +216,15 @@ class SchedulerConfig:
     while a larger value (e.g., 10) reduces host overhead and may increase throughput
     by batching multiple tokens before sending."""
 
+    prefill_only: bool = False
+    """If True, the engine runs in prefill-only mode (Prefill-Decode Disaggregation).
+
+    The scheduler will schedule requests as Shortest Remaining Job First (SRJF)
+    based on `num_prompt_tokens - num_computed_tokens`, ignore decode-phase
+    concerns (no block management beyond prefill), and the engine will finish
+    each request immediately after its prompt is fully prefilled without
+    entering the decode loop. This is the mode used by PD prefill nodes."""
+
     @staticmethod
     def default_factory(**kwargs):
         """Create a `SchedulerConfig` with default values for its `InitVar`s."""
@@ -308,6 +317,17 @@ class SchedulerConfig:
                 "Chunked prefill is enabled with max_num_batched_tokens=%d.",
                 self.max_num_batched_tokens,
             )
+
+        if self.prefill_only:
+            logger.info_once(
+                "Prefill-only mode enabled. Scheduling policy=%s, "
+                "runner will finish requests immediately after prefill.",
+                self.policy,
+            )
+            # Default to SRJF when prefill_only is enabled and the user
+            # has not explicitly chosen a different policy.
+            if self.policy == "fcfs":
+                self.policy = "srjf"
 
         self.verify_max_model_len(max_model_len)
 

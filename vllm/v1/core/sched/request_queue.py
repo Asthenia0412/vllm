@@ -15,6 +15,7 @@ class SchedulingPolicy(Enum):
 
     FCFS = "fcfs"
     PRIORITY = "priority"
+    SRJF = "srjf"
 
 
 class RequestQueue(ABC):
@@ -197,11 +198,87 @@ class PriorityRequestQueue(RequestQueue):
             yield heapq.heappop(heap_copy)
 
 
+class SRJFRequestQueue(RequestQueue):
+    """Shortest Remaining Job First queue.
+
+    Orders requests by their remaining prefill cost:
+        `num_prompt_tokens - num_computed_tokens`
+
+    Ties are broken by arrival time (earlier first), then request id.
+    This is the optimal scheduling policy for deterministic prefill jobs
+    such as those on a PD prefill-only node: it minimizes average waiting
+    time and enables SLO-aware admission control.
+    """
+
+    def __init__(self) -> None:
+        self._heap: list[tuple[int, float, str, Request]] = []
+        self._counter: int = 0
+
+    @staticmethod
+    def _job_size(req: Request) -> int:
+        """Remaining prefill work for this request."""
+        return max(0, req.num_prompt_tokens - req.num_computed_tokens)
+
+    def add_request(self, request: Request) -> None:
+        """Add a request ordered by remaining prefill cost."""
+        key = (
+            self._job_size(request),
+            request.arrival_time,
+            request.request_id,
+        )
+        heapq.heappush(self._heap, key + (request,))
+
+    def pop_request(self) -> Request:
+        """Pop the request with the shortest remaining job."""
+        if not self._heap:
+            raise IndexError("pop from empty heap")
+        return heapq.heappop(self._heap)[3]
+
+    def peek_request(self) -> Request:
+        """Peek at the shortest-remaining-job request."""
+        if not self._heap:
+            raise IndexError("peek from empty heap")
+        return self._heap[0][3]
+
+    def prepend_request(self, request: Request) -> None:
+        """No-op prepend — SRJF cannot express positional prepending."""
+        self.add_request(request)
+
+    def prepend_requests(self, requests: Iterable[Request]) -> None:
+        for request in requests:
+            self.add_request(request)
+
+    def remove_request(self, request: Request) -> None:
+        """Remove a specific request from the queue."""
+        self._heap = [entry for entry in self._heap if entry[3] is not request]
+        heapq.heapify(self._heap)
+
+    def remove_requests(self, requests: Iterable[Request]) -> None:
+        """Remove multiple specific requests from the queue."""
+        target_ids = {id(r) for r in requests}
+        self._heap = [entry for entry in self._heap if id(entry[3]) not in target_ids]
+        heapq.heapify(self._heap)
+
+    def __bool__(self) -> bool:
+        return bool(self._heap)
+
+    def __len__(self) -> int:
+        return len(self._heap)
+
+    def __iter__(self) -> Iterator[Request]:
+        """Yield requests in SRJF order (does not consume the heap)."""
+        heap_copy = self._heap[:]
+        while heap_copy:
+            yield heapq.heappop(heap_copy)[3]
+
+
 def create_request_queue(policy: SchedulingPolicy) -> RequestQueue:
     """Create request queue based on scheduling policy."""
     if policy == SchedulingPolicy.PRIORITY:
         return PriorityRequestQueue()
     elif policy == SchedulingPolicy.FCFS:
         return FCFSRequestQueue()
+    elif policy == SchedulingPolicy.SRJF:
+        return SRJFRequestQueue()
     else:
         raise ValueError(f"Unknown scheduling policy: {policy}")

@@ -149,11 +149,14 @@ class Scheduler(SchedulerInterface):
         )
         # Pooling and diffusion models do not append a sampled token after
         # prefill, so they should not reserve one context slot while scheduling.
+        # Prefill-only mode (PD prefill nodes) also skips decode entirely.
+        self.prefill_only = self.scheduler_config.prefill_only
         self.num_sampled_tokens_per_step = (
             0
             if (
                 vllm_config.model_config.runner_type == "pooling"
                 or vllm_config.model_config.is_diffusion
+                or self.prefill_only
             )
             else 1
         )
@@ -2183,6 +2186,16 @@ class Scheduler(SchedulerInterface):
                 # whole prompt is consumed. Encoder inputs are never scheduled
                 # past a multi-modal item the encoder cache could not admit, so
                 # a consumed prompt also means every item in it was encoded.
+                request.status = RequestStatus.FINISHED_STOPPED
+                stopped = True
+            elif (
+                self.prefill_only
+                and request.num_computed_tokens >= request.num_prompt_tokens
+            ):
+                # Prefill-Decode Disaggregation: prefill-only node finishes
+                # the request as soon as its full prompt has been prefilled.
+                # No decode tokens are sampled; the caller (PD prefill node)
+                # transfers KV cache to a decode node externally.
                 request.status = RequestStatus.FINISHED_STOPPED
                 stopped = True
 
