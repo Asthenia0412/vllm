@@ -19,6 +19,7 @@ from vllm.v1.kv_offload.base import (
     PrepareStoreOutput,
     ReqContext,
     RequestOffloadingContext,
+    ScheduleEndContext,
     get_offload_group_idx,
 )
 from vllm.v1.kv_offload.cpu.common import (
@@ -27,6 +28,8 @@ from vllm.v1.kv_offload.cpu.common import (
 )
 from vllm.v1.kv_offload.cpu.policies.base import CachePolicy, ChunkStatus
 from vllm.v1.kv_offload.cpu.policies.factory import CachePolicyFactory
+from vllm.v1.kv_offload.cpu.policies.offload_factory import OffloadPolicyFactory
+from vllm.v1.kv_offload.cpu.policies.store_policy import OffloadPolicy
 from vllm.v1.metrics.cache_hit_source import CacheHitSource
 
 
@@ -63,6 +66,8 @@ class CPUOffloadingManager(OffloadingManager):
         enable_events: bool = False,
         store_threshold: int = 1,
         max_tracker_size: int = 64_000,
+        offload_policy: str = "store_on_compute",
+        offload_policy_module_path: str | None = None,
     ):
         self.medium: Medium = Medium.CPU
         self._num_chunks: int = num_chunks
@@ -73,6 +78,17 @@ class CPUOffloadingManager(OffloadingManager):
             cache_policy, cache_policy_module_path
         )
         self._policy: CachePolicy = policy_cls(cache_capacity=num_chunks)
+
+        offload_policy_cls = OffloadPolicyFactory.get_offload_policy_cls(
+            offload_policy, offload_policy_module_path
+        )
+        self._offload_policy: OffloadPolicy = offload_policy_cls()
+
+        # Request IDs preempted / finished in the current scheduler step.
+        # Populated by on_schedule_end() and consulted by prepare_store().
+        self._preempted_req_ids: set[str] = set()
+        self._finished_req_ids: set[str] = set()
+
         # Track the number of chunks in the cache that are evictable. i.e. ref_cnt 0.
         self._num_evictable_cache_chunks: int = 0
         # Track chunks with an in-flight store (ref_cnt -1, not yet completed).
@@ -248,11 +264,32 @@ class CPUOffloadingManager(OffloadingManager):
                 self._policy.mark_evictable(key)
 
     @override
+    def on_schedule_end(self, context: ScheduleEndContext) -> None:
+        """Capture per-step preempted / finished request IDs for the
+        OffloadPolicy consulted in ``prepare_store``."""
+        self._preempted_req_ids = set(context.preempted_req_ids)
+        self._finished_req_ids = set(context.finished_req_ids)
+        self._offload_policy.update_preempted(self._preempted_req_ids)
+
+    @override
     def prepare_store(
         self,
         keys: Collection[OffloadKey],
         req_context: ReqContext,
     ) -> PrepareStoreOutput | None:
+        # OffloadPolicy gate: skip store for this request if the policy
+        # says so (e.g. PreemptionOnlyPolicy skips active non-preempted requests).
+        if not self._offload_policy.should_store(
+            req_id=req_context.req_id,
+            preempted_req_ids=self._preempted_req_ids,
+            is_finished=req_context.req_id in self._finished_req_ids,
+        ):
+            return PrepareStoreOutput(
+                keys_to_store=[],
+                store_spec=self._get_load_store_spec([], []),
+                evicted_keys=[],
+            )
+
         keys = list(keys)
         if self.counts is not None:
             self._record_accesses(keys)

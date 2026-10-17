@@ -147,6 +147,10 @@ class ScheduleEndContext(NamedTuple):
     new_req_ids: Collection[str]
     # Request IDs preempted this step.
     preempted_req_ids: Collection[str]
+    # Request IDs that finished this step. Added to allow OffloadPolicy
+    # implementations to distinguish finished requests (whose GPU blocks
+    # will be freed) from still-active non-preempted ones.
+    finished_req_ids: Collection[str] = ()
 
 
 class LoadStoreSpec:

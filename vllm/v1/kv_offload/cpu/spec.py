@@ -135,6 +135,12 @@ class CPUOffloadingSpec(OffloadingSpec):
         self.cache_policy_module_path: str | None = self.extra_config.get(
             "cache_policy_module_path"
         )
+        self.offload_policy: str = self.extra_config.get(
+            "offload_policy", "store_on_compute"
+        )
+        self.offload_policy_module_path: str | None = self.extra_config.get(
+            "offload_policy_module_path"
+        )
 
     @override
     def get_manager(self) -> OffloadingManager:
@@ -155,6 +161,8 @@ class CPUOffloadingSpec(OffloadingSpec):
                 enable_events=self.kv_events_config.enable_kv_cache_events,
                 store_threshold=store_threshold,
                 max_tracker_size=max_tracker_size,
+                offload_policy=self.offload_policy,
+                offload_policy_module_path=self.offload_policy_module_path,
             )
         return self._manager
 

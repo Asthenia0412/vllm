@@ -1854,6 +1854,7 @@ class OffloadingConnectorScheduler:
         schedule_end_context = ScheduleEndContext(
             new_req_ids=[req.req_id for req in scheduler_output.scheduled_new_reqs],
             preempted_req_ids=scheduler_output.preempted_req_ids or (),
+            finished_req_ids=scheduler_output.finished_req_ids or (),
         )
         self.manager.on_schedule_end(schedule_end_context)
 
