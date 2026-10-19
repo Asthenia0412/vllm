@@ -690,9 +690,7 @@ class Llama4Model(LlamaModel):
                             and loaded_weight.dtype == torch.float8_e4m3fn
                             and loaded_weight.ndim == 3
                         ):
-                            loaded_weight = loaded_weight.transpose(
-                                -1, -2
-                            ).contiguous()
+                            loaded_weight = loaded_weight.transpose(-1, -2).contiguous()
 
                         # Load the weight into the module parameter with
                         # corresponding shard id and expert id.
